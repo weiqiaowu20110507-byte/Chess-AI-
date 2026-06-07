@@ -15,7 +15,16 @@ import time
 import random
 import os
 import pickle
+import multiprocessing as mp
 import numpy as np
+
+# Limit thread oversubscription — critical for multiprocessing
+# Without this, each worker tries to use ALL CPU cores internally,
+# causing 100% CPU usage even with few workers.
+os.environ['OMP_NUM_THREADS']      = '1'
+os.environ['MKL_NUM_THREADS']      = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['NUMEXPR_NUM_THREADS']  = '1'
 
 # PyTorch — used for GPU-accelerated neural network
 # Install: pip install torch   (then restart)
@@ -23,6 +32,8 @@ try:
     import torch
     import torch.nn as nn
     import torch.optim as optim
+    torch.set_num_threads(1)              # one thread per worker
+    torch.set_num_interop_threads(1)
     _TORCH_OK = True
 except ImportError:
     _TORCH_OK = False
@@ -35,6 +46,13 @@ TRAIN_DEPTH = 3     # search depth during self-play training
                     #  2 = fast (~60 games/hr)
                     #  3 = balanced (default)
                     #  4 = strong  (~10 games/hr)
+NUM_WORKERS = 4     # parallel self-play workers during --train
+                    #  0    = auto (use all CPU cores)
+                    #  1    = single core (old behavior)
+                    #  4,6,8 = use that many cores
+WORK_MINUTES     = 60   # train continuously for this many minutes
+COOLDOWN_MINUTES = 5    # then pause for this many minutes (lets CPU cool)
+                        # set WORK_MINUTES = 0 to disable cooldown breaks
 # ══════════════════════════════════════════════════════
 
 # ── Unicode pieces ────────────────────────────────────────────────────────────
@@ -305,15 +323,24 @@ class Board:
     def display(self, perspective='w'):
         rows = range(8) if perspective == 'w' else range(7, -1, -1)
         cols = range(8) if perspective == 'w' else range(7, -1, -1)
-        LIGHT = '\033[48;5;223m'
-        DARK  = '\033[48;5;136m'
+
+        # chess.com palette with boosted contrast
+        LIGHT = '\033[48;2;245;230;180m'   # warm cream
+        DARK  = '\033[48;2;75;110;55m'     # deep forest green
+        WHITE_PIECE = '\033[38;2;255;255;255m\033[1m'
+        BLACK_PIECE = '\033[38;2;0;0;0m\033[1m'
+
         RESET = '\033[0m'
         BOLD  = '\033[1m'
+        DIM   = '\033[2m'
+
         print()
         top_bar, bot_bar = self.score_bar(perspective)
         print(top_bar)
+
         col_labels = ' ' + '  '.join(COLS[c] for c in cols)
-        print(f"  {BOLD}{col_labels}{RESET}")
+        print(f"  {DIM}{col_labels}{RESET}")
+
         for r in rows:
             rank = 8 - r
             row_str = f"{BOLD}{rank}{RESET} "
@@ -321,11 +348,16 @@ class Board:
                 light = (r + c) % 2 == 0
                 bg = LIGHT if light else DARK
                 piece = self.grid[r][c]
-                symbol = str(piece) if piece else ' '
-                row_str += f"{bg} {symbol} {RESET}"
+                if piece:
+                    color_code = WHITE_PIECE if piece.color == 'w' else BLACK_PIECE
+                    sym = UNICODE[(piece.kind, piece.color)]
+                    row_str += f"{bg} {color_code}{sym}{RESET}{bg} {RESET}"
+                else:
+                    row_str += f"{bg}   {RESET}"
             row_str += f" {BOLD}{rank}{RESET}"
             print(row_str)
-        print(f"  {BOLD}{col_labels}{RESET}")
+
+        print(f"  {DIM}{col_labels}{RESET}")
         print(bot_bar)
 
 # ── Move generation ───────────────────────────────────────────────────────────
@@ -1411,8 +1443,399 @@ def negamax(board, depth, alpha, beta, color, deadline, ply=0, do_null=True):
 
 # ── Iterative deepening ───────────────────────────────────────────────────────
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Opening Book ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Maps position hash → list of (move_uci, weight) pairs
+# Weight = relative frequency; higher = play more often
+# Covers main lines of ~25 openings to ~8 moves deep
+
+OPENING_BOOK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  'chess_opening_book.pkl')
+
+# Hand-curated lines covering common openings (move sequences in UCI)
+# Format: list of complete games or partial sequences from white POV
+_OPENING_LINES = [
+    # ─── King's Pawn ───
+    # Ruy Lopez (Spanish)
+    "e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5a4 g8f6 e1g1 f8e7 f1e1 b7b5 a4b3 d7d6 c2c3 e8g8",
+    "e2e4 e7e5 g1f3 b8c6 f1b5 g8f6 e1g1 f8e7 f1e1 b7b5 a4b3 d7d6",
+    "e2e4 e7e5 g1f3 b8c6 f1b5 f7f5",                                                  # Schliemann
+    # Italian Game
+    "e2e4 e7e5 g1f3 b8c6 f1c4 f8c5 c2c3 g8f6 d2d4 e5d4 c3d4 c5b4",                   # Giuoco Piano
+    "e2e4 e7e5 g1f3 b8c6 f1c4 g8f6 d2d3 f8c5 e1g1 d7d6 c2c3 a7a6",                   # Italian Quiet
+    "e2e4 e7e5 g1f3 b8c6 f1c4 f8c5 b1c3 g8f6 d2d3 d7d6 c1g5",                        # Italian
+    # Scotch Game
+    "e2e4 e7e5 g1f3 b8c6 d2d4 e5d4 f3d4 g8f6 b1c3 f8b4",
+    # King's Gambit
+    "e2e4 e7e5 f2f4 e5f4 g1f3 g7g5 h2h4 g5g4 f3e5",
+    "e2e4 e7e5 f2f4 f8c5 g1f3 d7d6 b1c3 g8f6",
+    # Petrov Defence
+    "e2e4 e7e5 g1f3 g8f6 f3e5 d7d6 e5f3 f6e4 d2d4 d6d5",
+    # Philidor
+    "e2e4 e7e5 g1f3 d7d6 d2d4 g8f6 b1c3 b8d7",
+    # Vienna
+    "e2e4 e7e5 b1c3 g8f6 f2f4 d7d5 f4e5 f6e4",
+    # Four Knights
+    "e2e4 e7e5 g1f3 b8c6 b1c3 g8f6 f1b5 f8b4",
+    # Sicilian Najdorf
+    "e2e4 c7c5 g1f3 d7d6 d2d4 c5d4 f3d4 g8f6 b1c3 a7a6 c1e3 e7e5 d4b3 c8e6",
+    "e2e4 c7c5 g1f3 d7d6 d2d4 c5d4 f3d4 g8f6 b1c3 a7a6 f1e2 e7e5 d4b3 f8e7",
+    # Sicilian Dragon
+    "e2e4 c7c5 g1f3 d7d6 d2d4 c5d4 f3d4 g8f6 b1c3 g7g6 c1e3 f8g7 f2f3 e8g8",
+    # Sicilian Sveshnikov
+    "e2e4 c7c5 g1f3 b8c6 d2d4 c5d4 f3d4 g8f6 b1c3 e7e5 d4b5 d7d6",
+    # Sicilian Taimanov
+    "e2e4 c7c5 g1f3 e7e6 d2d4 c5d4 f3d4 b8c6 b1c3 d8c7",
+    # Sicilian Classical
+    "e2e4 c7c5 g1f3 d7d6 d2d4 c5d4 f3d4 g8f6 b1c3 b8c6 c1g5",
+    # Sicilian Closed
+    "e2e4 c7c5 b1c3 b8c6 g2g3 g7g6 f1g2 f8g7",
+    # French Defence
+    "e2e4 e7e6 d2d4 d7d5 b1c3 g8f6 c1g5 f8e7 e4e5 f6d7",                              # Classical
+    "e2e4 e7e6 d2d4 d7d5 b1c3 f8b4 e4e5 c7c5 a2a3 b4c3",                              # Winawer
+    "e2e4 e7e6 d2d4 d7d5 b1d2 g8f6 e4e5 f6d7 f1d3",                                   # Tarrasch
+    "e2e4 e7e6 d2d4 d7d5 e4e5 c7c5 c2c3 b8c6 g1f3",                                   # Advance
+    # Caro-Kann
+    "e2e4 c7c6 d2d4 d7d5 b1c3 d5e4 c3e4 c8f5 e4g3 f5g6 h2h4 h7h6",                    # Classical
+    "e2e4 c7c6 d2d4 d7d5 e4e5 c8f5 g1f3 e7e6 f1e2 c6c5",                              # Advance
+    "e2e4 c7c6 d2d4 d7d5 e4d5 c6d5 c2c4 g8f6",                                        # Exchange
+    # Pirc / Modern
+    "e2e4 d7d6 d2d4 g8f6 b1c3 g7g6 f2f4 f8g7",
+    "e2e4 g7g6 d2d4 f8g7 b1c3 d7d6 g1f3 g8f6",
+    # Scandinavian
+    "e2e4 d7d5 e4d5 d8d5 b1c3 d5a5 d2d4 g8f6 g1f3 c7c6",
+    # Alekhine
+    "e2e4 g8f6 e4e5 f6d5 d2d4 d7d6 g1f3 g7g6",
+
+    # ─── Queen's Pawn ───
+    # Queen's Gambit Declined
+    "d2d4 d7d5 c2c4 e7e6 b1c3 g8f6 c1g5 f8e7 e2e3 e8g8 g1f3 h7h6 g5h4",
+    "d2d4 d7d5 c2c4 e7e6 g1f3 g8f6 b1c3 f8e7 c1g5 h7h6",                              # Tartakower
+    # Queen's Gambit Accepted
+    "d2d4 d7d5 c2c4 d5c4 g1f3 g8f6 e2e3 e7e6 f1c4 c7c5",
+    # Slav
+    "d2d4 d7d5 c2c4 c7c6 g1f3 g8f6 b1c3 d5c4 a2a4 c8f5",
+    # Semi-Slav
+    "d2d4 d7d5 c2c4 c7c6 g1f3 g8f6 b1c3 e7e6 c1g5 d5c4",
+    # King's Indian Defence
+    "d2d4 g8f6 c2c4 g7g6 b1c3 f8g7 e2e4 d7d6 g1f3 e8g8 f1e2 e7e5 e1g1 b8c6",
+    "d2d4 g8f6 c2c4 g7g6 b1c3 f8g7 e2e4 d7d6 f2f3 e8g8 c1e3 e7e5",                    # Sämisch
+    # Nimzo-Indian
+    "d2d4 g8f6 c2c4 e7e6 b1c3 f8b4 e2e3 e8g8 f1d3 d7d5 g1f3 c7c5",
+    # Queen's Indian
+    "d2d4 g8f6 c2c4 e7e6 g1f3 b7b6 g2g3 c8b7 f1g2 f8e7",
+    # Grünfeld
+    "d2d4 g8f6 c2c4 g7g6 b1c3 d7d5 c4d5 f6d5 e2e4 d5c3 b2c3 f8g7",
+    # Catalan
+    "d2d4 g8f6 c2c4 e7e6 g2g3 d7d5 f1g2 f8e7 g1f3 e8g8",
+    # Benoni
+    "d2d4 g8f6 c2c4 c7c5 d4d5 e7e6 b1c3 e6d5 c4d5 d7d6",
+    # Dutch
+    "d2d4 f7f5 g2g3 g8f6 f1g2 e7e6 g1f3 f8e7",                                        # Classical
+    "d2d4 f7f5 c2c4 g8f6 b1c3 e7e6 g1f3 f8b4",                                        # Nimzo-Dutch
+    # London System
+    "d2d4 g8f6 g1f3 d7d5 c1f4 c7c5 e2e3 b8c6 c2c3",
+    # Trompowsky
+    "d2d4 g8f6 c1g5",
+
+    # ─── Flank Openings ───
+    # English
+    "c2c4 e7e5 b1c3 g8f6 g1f3 b8c6 g2g3 f8b4 f1g2",
+    "c2c4 g8f6 b1c3 e7e6 g1f3 d7d5",
+    "c2c4 c7c5 g1f3 g8f6 g2g3 b7b6",                                                  # Symmetrical
+    # Réti
+    "g1f3 d7d5 c2c4 e7e6 g2g3 g8f6 f1g2 f8e7 e1g1",
+    # Bird's
+    "f2f4 d7d5 g1f3 g8f6 e2e3",
+    # King's Indian Attack
+    "g1f3 d7d5 g2g3 g8f6 f1g2 c7c6 e1g1",
+]
+
+
+def _square_to_rc(sq):
+    """e2 → (6,4)"""
+    return (8 - int(sq[1]), 'abcdefgh'.index(sq[0]))
+
+def _move_uci_to_internal(board, color, uci):
+    """Convert UCI move (e.g. 'e2e4') to internal (r0,c0,r1,c1,flag)."""
+    fr, fc = _square_to_rc(uci[:2])
+    tr, tc = _square_to_rc(uci[2:4])
+    for mv in legal_moves(board, color):
+        if (mv[0], mv[1], mv[2], mv[3]) == (fr, fc, tr, tc):
+            return mv
+    return None
+
+
+def build_opening_book():
+    """Build {position_hash: [(move, weight), ...]} from _OPENING_LINES."""
+    book = {}
+    for line in _OPENING_LINES:
+        b     = Board()
+        color = 'w'
+        moves = line.strip().split()
+        for uci in moves:
+            mv = _move_uci_to_internal(b, color, uci)
+            if mv is None:
+                break    # invalid sequence
+            key = zobrist_hash(b, color)
+            entry = book.setdefault(key, {})
+            move_key = (mv[0], mv[1], mv[2], mv[3], mv[4])
+            entry[move_key] = entry.get(move_key, 0) + 1
+            b = apply_move(b, *mv)
+            if b is None: break
+            color = 'b' if color == 'w' else 'w'
+    # Convert inner dicts to weighted lists
+    return {k: list(v.items()) for k, v in book.items()}
+
+
+_OPENING_BOOK = None
+
+def get_opening_book():
+    global _OPENING_BOOK
+    if _OPENING_BOOK is None:
+        # Try to load from disk first (so PGN-augmented book persists)
+        if os.path.exists(OPENING_BOOK_FILE):
+            try:
+                with open(OPENING_BOOK_FILE, 'rb') as f:
+                    _OPENING_BOOK = pickle.load(f)
+                    return _OPENING_BOOK
+            except Exception:
+                pass
+        _OPENING_BOOK = build_opening_book()
+        try:
+            with open(OPENING_BOOK_FILE, 'wb') as f:
+                pickle.dump(_OPENING_BOOK, f)
+        except Exception:
+            pass
+    return _OPENING_BOOK
+
+
+def opening_book_move(board, color):
+    """Return a move from the book, or None if not in book."""
+    book = get_opening_book()
+    key  = zobrist_hash(board, color)
+    entries = book.get(key)
+    if not entries:
+        return None
+    # Weighted random choice
+    total   = sum(w for _, w in entries)
+    pick    = random.uniform(0, total)
+    running = 0
+    for move_key, weight in entries:
+        running += weight
+        if running >= pick:
+            return move_key   # (r0,c0,r1,c1,flag)
+    return entries[0][0]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── PGN Importer: learn from master games ─────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _san_to_move(board, color, san):
+    """Convert standard algebraic notation (Nf3, Bxc4, O-O) to internal move."""
+    san = san.strip().rstrip('+#!?')
+    # Castling
+    if san in ('O-O', '0-0'):
+        for mv in legal_moves(board, color):
+            if mv[4] == 'castle_k': return mv
+        return None
+    if san in ('O-O-O', '0-0-0'):
+        for mv in legal_moves(board, color):
+            if mv[4] == 'castle_q': return mv
+        return None
+
+    # Piece type (default pawn)
+    piece = 'P'
+    s     = san
+    if s and s[0] in 'KQRBN':
+        piece = s[0]
+        s     = s[1:]
+
+    # Promotion
+    promo = None
+    if '=' in s:
+        s, promo = s.split('=')
+        promo = promo[0].upper()
+
+    # Capture marker
+    s = s.replace('x', '')
+
+    # Destination (last 2 chars)
+    if len(s) < 2:
+        return None
+    dest = s[-2:]
+    try:
+        tr, tc = _square_to_rc(dest)
+    except Exception:
+        return None
+
+    # Disambiguation hints (any leading file/rank in s)
+    hint = s[:-2]
+    hint_file = hint_rank = None
+    for ch in hint:
+        if ch in 'abcdefgh': hint_file = 'abcdefgh'.index(ch)
+        elif ch in '12345678': hint_rank = 8 - int(ch)
+
+    # Find matching legal move
+    for mv in legal_moves(board, color):
+        r0, c0, r1, c1, flag = mv
+        if (r1, c1) != (tr, tc): continue
+        p = board.get(r0, c0)
+        if p is None or p.kind != piece: continue
+        if hint_file is not None and c0 != hint_file: continue
+        if hint_rank is not None and r0 != hint_rank: continue
+        return mv
+    return None
+
+
+def parse_pgn_file(path, max_games=None):
+    """
+    Yield lists of moves (each list = one game's moves in internal format).
+    Skips games that can't be parsed cleanly.
+    """
+    import re
+    if not os.path.exists(path):
+        return
+
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        text = f.read()
+
+    # Strip comments {…} and variations (…)
+    text = re.sub(r'\{[^}]*\}', '', text)
+    text = re.sub(r'\([^)]*\)', '', text)
+    # Strip ALL PGN headers [Tag "value"] before splitting
+    text = re.sub(r'\[[^\]]*\]', '', text)
+
+    # Split on result tokens
+    games_raw = re.split(r'(1-0|0-1|1/2-1/2|\*)', text)
+    games = []
+    for i in range(0, len(games_raw) - 1, 2):
+        body   = games_raw[i]
+        result = games_raw[i + 1]
+        # Strip move numbers like 1. 1... 23.
+        body = re.sub(r'\d+\.+', '', body)
+        body = body.strip()
+        if not body:
+            continue
+        moves_san = body.split()
+        games.append((moves_san, result))
+
+    parsed = 0
+    for moves_san, result in games:
+        b     = Board()
+        color = 'w'
+        moves = []
+        ok    = True
+        for san in moves_san:
+            if san in ('1-0', '0-1', '1/2-1/2', '*'):
+                break
+            mv = _san_to_move(b, color, san)
+            if mv is None:
+                ok = False
+                break
+            moves.append((b.copy(), color, mv))
+            b = apply_move(b, *mv)
+            if b is None:
+                ok = False; break
+            color = 'b' if color == 'w' else 'w'
+
+        if ok and len(moves) >= 6:
+            outcome = (1.0 if result == '1-0' else
+                      -1.0 if result == '0-1' else 0.0)
+            yield moves, outcome
+            parsed += 1
+            if max_games and parsed >= max_games:
+                return
+
+
+def import_pgn(path, max_games=None, add_to_book=True, add_to_replay=True):
+    """
+    Load games from a PGN file and feed them into the system:
+      - Positions go into the NN replay buffer (so it learns from masters)
+      - Opening positions (first 12 moves) extend the opening book
+    """
+    if not _TORCH_OK:
+        print("  PyTorch not available — replay training will be slow.")
+
+    net    = _get_net()
+    replay = _get_replay()
+    book   = get_opening_book() if add_to_book else None
+
+    print(f"\n  Importing PGN: {path}")
+    print(f"  This may take a while for large files...\n")
+
+    games_done = positions_added = book_added = 0
+    start      = time.time()
+
+    for moves, outcome in parse_pgn_file(path, max_games):
+        try:
+            games_done += 1
+            for ply, (snap, color, mv) in enumerate(moves):
+                if add_to_replay:
+                    enc = encode_board(snap, color)
+                    signed = outcome if color == 'w' else -outcome
+                    replay.push(enc, signed)
+                    positions_added += 1
+                # First 12 ply go in opening book
+                if add_to_book and ply < 24:
+                    key = zobrist_hash(snap, color)
+                    mv_key = (mv[0], mv[1], mv[2], mv[3], mv[4])
+                    entries = book.setdefault(key, [])
+                    # Increment weight if move already present
+                    for i, (m, w) in enumerate(entries):
+                        if m == mv_key:
+                            entries[i] = (m, w + 1)
+                            break
+                    else:
+                        entries.append((mv_key, 1))
+                        book_added += 1
+        except Exception:
+            # Skip any game that causes processing errors — don't spam output
+            continue
+
+        if games_done % 50 == 0:
+            elapsed = time.time() - start
+            rate    = games_done / max(elapsed, 0.001)
+            print(f"  {games_done:>5} games  |  "
+                  f"{positions_added:>6} positions  |  "
+                  f"{book_added:>5} new book moves  |  "
+                  f"{rate:.1f} games/sec", flush=True)
+
+    # Save everything
+    replay.save()
+    if add_to_book:
+        try:
+            with open(OPENING_BOOK_FILE, 'wb') as f:
+                pickle.dump(book, f)
+        except Exception:
+            pass
+
+    # Train NN on the new positions
+    print(f"\n  Imported {games_done} games. Training NN on replay buffer...")
+    for _ in range(20):
+        _batch_train(net, replay)
+    net.save()
+
+    print(f"  Done!")
+    print(f"  Games imported   : {games_done}")
+    print(f"  Positions added  : {positions_added}")
+    print(f"  Book entries new : {book_added}")
+    print(f"  Total replay     : {len(replay.buf)}")
+
+
 def best_move_id(board, color, time_limit=TIME_LIMIT):
-    """Iterative deepening with aspiration windows."""
+    """Iterative deepening with aspiration windows + opening book."""
+    # Opening book lookup first (instant — no search needed)
+    if board.full_moves <= 15:
+        book_move = opening_book_move(board, color)
+        if book_move is not None:
+            # Verify the move is still legal (sanity check)
+            for mv in legal_moves(board, color):
+                if (mv[0], mv[1], mv[2], mv[3]) == book_move[:4]:
+                    return mv
+
     # Guaranteed fallback
     moves = legal_moves(board, color)
     if not moves:
@@ -1658,110 +2081,216 @@ def main():
 # ── Self-play training loop ───────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── Self-play worker (runs in a child process) ───────────────────────────────
+def _selfplay_worker(worker_id, result_queue, stop_event, pause_event=None):
+    """
+    Worker process: plays games using the classical engine (no NN in worker).
+    Sends (outcome, positions) back to the main process for training.
+    Honors pause_event — sleeps while it's set (cooldown break).
+    """
+    import os
+    # Each worker uses a different random seed
+    random.seed(os.getpid() + worker_id * 1000 + int(time.time()))
+
+    opp_map   = {'w': 'b', 'b': 'w'}
+    MAX_MOVES = 200
+
+    while not stop_event.is_set():
+        # If main process signaled a cooldown break, just sleep
+        if pause_event is not None and pause_event.is_set():
+            time.sleep(1.0)
+            continue
+        board    = Board()
+        turn     = 'w'
+        outcome  = None
+        positions = []
+
+        for _ in range(MAX_MOVES):
+            if stop_event.is_set():
+                return
+            moves = legal_moves(board, turn)
+            if not moves:
+                outcome = (-1.0 if is_in_check(board, turn) and turn == 'w' else
+                            1.0 if is_in_check(board, turn) else 0.0)
+                break
+
+            move = best_move_id(board, turn, time_limit=2.0)
+            if not move:
+                outcome = 0.0; break
+
+            positions.append((encode_board(board, turn), turn))
+
+            r0, c0, r1, c1, flag = move
+            board = apply_move(board, r0, c0, r1, c1, flag)
+            if not board:
+                outcome = 0.0; break
+            if board.half_moves >= 100:
+                outcome = 0.0; break
+            if turn == 'b':
+                board.full_moves += 1
+            turn = opp_map[turn]
+
+        if outcome is None:
+            outcome = 0.0
+
+        try:
+            result_queue.put((outcome, positions, worker_id), timeout=5.0)
+        except Exception:
+            pass
+
+
 def train_forever():
     """
-    Run self-play games indefinitely, training the neural network after each one.
-    Press Ctrl+C to stop — weights are saved automatically.
-    Run with:  python3 chess.py --train
+    Parallel self-play training.
+    NUM_WORKERS child processes generate games in parallel.
+    Main process collects results, trains the network, saves weights.
+    Press Ctrl+C to stop — weights save after every game.
     """
     net    = _get_net()
     replay = _get_replay()
 
-    # TRAIN_DEPTH is set at the top of the file
-    MAX_MOVES   = 200    # draw after this many moves
-    BATCH_EVERY = 5      # replay batch training every N games
-    REPORT_EVERY= 10
+    # Decide worker count
+    if NUM_WORKERS == 0:
+        workers = max(1, mp.cpu_count() - 1)   # leave 1 core for main+save
+    else:
+        workers = max(1, NUM_WORKERS)
+
+    BATCH_EVERY  = 5
+    REPORT_EVERY = 1   # report after every game by default
 
     print("\n" + "═" * 56)
     print("  ♟  Chess Self-Play Trainer  ♟")
     print("═" * 56)
     if _TORCH_OK:
-        dev_name = torch.cuda.get_device_name(0) if _DEVICE.type=='cuda' else str(_DEVICE).upper()
+        dev_name = torch.cuda.get_device_name(0) if _DEVICE.type == 'cuda' else str(_DEVICE).upper()
         print(f"  Device   : {dev_name}")
     else:
         print( "  Device   : CPU (numpy fallback — install PyTorch for GPU)")
-    wf = WEIGHTS_FILE.replace('.npz','.pt') if _TORCH_OK else WEIGHTS_FILE
+    wf = WEIGHTS_FILE.replace('.npz', '.pt') if _TORCH_OK else WEIGHTS_FILE
     print(f"  Weights  : {wf}")
     print(f"  Games    : {net.games_trained} trained so far")
     print(f"  Replay   : {len(replay.buf)} positions stored")
     print(f"  Depth    : {TRAIN_DEPTH} (per move)")
+    print(f"  Workers  : {workers} parallel self-play processes")
+    if WORK_MINUTES > 0:
+        print(f"  Schedule : work {WORK_MINUTES} min, cooldown {COOLDOWN_MINUTES} min, repeat")
     print("  Press Ctrl+C to stop — progress saved after every game.")
     print("═" * 56 + "\n")
 
-    opp_map  = {'w':'b','b':'w'}
-    game_num = w_wins = b_wins = draws = 0
+    # Launch worker processes
+    ctx          = mp.get_context('spawn')   # Windows-safe
+    result_queue = ctx.Queue(maxsize=workers * 4)
+    stop_event   = ctx.Event()
+    pause_event  = ctx.Event()   # set during cooldown break
+
+    procs = []
+    for i in range(workers):
+        p = ctx.Process(target=_selfplay_worker,
+                        args=(i, result_queue, stop_event, pause_event),
+                        daemon=True)
+        p.start()
+        procs.append(p)
+
+    game_num = 0
+    w_wins   = b_wins = draws = 0
+    start_t  = time.time()
+    work_start = time.time()   # when current work session began
 
     try:
         while True:
-            game_num += 1
-            board    = Board()
-            trainer  = TDTrainer(net)
-            trainer.reset()
-            turn     = 'w'
-            outcome  = None
-            positions = []
+            # ── Cooldown check: pause every WORK_MINUTES for COOLDOWN_MINUTES ──
+            if WORK_MINUTES > 0 and time.time() - work_start >= WORK_MINUTES * 60:
+                pause_event.set()
+                cooldown_secs = COOLDOWN_MINUTES * 60
+                # Drain any remaining results in the queue
+                drained = 0
+                drain_deadline = time.time() + 30
+                while time.time() < drain_deadline:
+                    try:
+                        result_queue.get(timeout=2.0)
+                        drained += 1
+                    except Exception:
+                        break
+                # Save state before cooldown
+                net.save(); replay.save()
+                print(f"\n  ⏸  Cooldown break — pausing {COOLDOWN_MINUTES} min "
+                      f"(CPU rest, weights saved).", flush=True)
+                end_break = time.time() + cooldown_secs
+                while time.time() < end_break:
+                    remain = int(end_break - time.time())
+                    mins, secs = remain // 60, remain % 60
+                    print(f"  ⏳  Resuming in {mins:02d}:{secs:02d}", end='\r', flush=True)
+                    time.sleep(1.0)
+                print("\n  ▶  Resuming training…\n", flush=True)
+                pause_event.clear()
+                work_start = time.time()   # reset clock for next work session
 
-            for _ in range(MAX_MOVES):
-                moves = legal_moves(board, turn)
-                if not moves:
-                    outcome = (-1.0 if is_in_check(board, turn) and turn=='w' else
-                                1.0 if is_in_check(board, turn) else 0.0)
+            # Pull a finished game from any worker
+            try:
+                outcome, positions, wid = result_queue.get(timeout=60.0)
+            except Exception:
+                # No result in 60s — workers may have died
+                alive = sum(p.is_alive() for p in procs)
+                if alive == 0:
+                    print("  All workers died — exiting.")
                     break
+                continue
 
-                move = best_move_id(board, turn, time_limit=2.0)
-                if not move:
-                    outcome = 0.0; break
+            game_num += 1
+            net.games_trained += 1
 
-                positions.append((encode_board(board, turn), turn))
-                trainer.step(board, turn)
-
-                r0,c0,r1,c1,flag = move
-                board = apply_move(board, r0, c0, r1, c1, flag)
-                if not board:
-                    outcome = 0.0; break
-
-                if board.half_moves >= 100:
-                    outcome = 0.0; break
-
-                if turn == 'b':
-                    board.full_moves += 1
-                turn = opp_map[turn]
-
-            if outcome is None:
-                outcome = 0.0
-
-            trainer.finish(board, outcome)
-
+            # Push experience to replay buffer
             for enc, color in positions:
                 signed = outcome if color == 'w' else -outcome
                 replay.push(enc, signed)
 
+            # Train NN on a batch
             if game_num % BATCH_EVERY == 0:
                 _batch_train(net, replay)
                 net.save()
                 replay.save()
 
+            # Tally results
             if outcome > 0:   w_wins += 1
             elif outcome < 0: b_wins += 1
             else:             draws  += 1
 
+            # Report
             if game_num % REPORT_EVERY == 0:
-                t = w_wins + b_wins + draws
+                t      = w_wins + b_wins + draws
+                rate   = game_num / max(1, time.time() - start_t) * 3600
                 print(f"  Game {net.games_trained:>5}  │  "
                       f"W {w_wins/t*100:4.0f}%  "
                       f"B {b_wins/t*100:4.0f}%  "
                       f"D {draws/t*100:4.0f}%  │  "
-                      f"Replay {len(replay.buf):>6}")
-                w_wins = b_wins = draws = 0
+                      f"Replay {len(replay.buf):>6}  │  "
+                      f"{rate:5.0f} games/hr  │  "
+                      f"worker #{wid}", flush=True)
 
     except KeyboardInterrupt:
+        print("\n  Stopping workers…")
+        stop_event.set()
+        for p in procs:
+            p.join(timeout=3.0)
+            if p.is_alive():
+                p.terminate()
         net.save(); replay.save()
-        print(f"\n  Stopped. Total games: {net.games_trained}")
-        print(f"  Weights → {WEIGHTS_FILE}")
+        print(f"  Stopped. Total games: {net.games_trained}")
+        print(f"  Weights → {WEIGHTS_FILE.replace(chr(46)+chr(110)+chr(112)+chr(122), chr(46)+chr(112)+chr(116)) if _TORCH_OK else WEIGHTS_FILE}")
 
 
 if __name__ == '__main__':
-    if '--train' in sys.argv:
+    mp.freeze_support()   # required on Windows for multiprocessing
+    if '--import-pgn' in sys.argv:
+        # Usage: python chess.py --import-pgn games.pgn [max_games]
+        idx = sys.argv.index('--import-pgn')
+        if idx + 1 >= len(sys.argv):
+            print("Usage: python chess.py --import-pgn <file.pgn> [max_games]")
+            sys.exit(1)
+        pgn_path  = sys.argv[idx + 1]
+        max_games = int(sys.argv[idx + 2]) if len(sys.argv) > idx + 2 else None
+        import_pgn(pgn_path, max_games=max_games)
+    elif '--train' in sys.argv:
         train_forever()
     else:
         main()
