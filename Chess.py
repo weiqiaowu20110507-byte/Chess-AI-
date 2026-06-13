@@ -42,10 +42,13 @@ except ImportError:
 # ── SETTINGS — edit these to tune the engine ──────────
 # ══════════════════════════════════════════════════════
 TIME_LIMIT  = 8.0   # seconds AI thinks per move in-game  (↑ stronger, ↓ faster)
-TRAIN_DEPTH = 3     # search depth during self-play training
-                    #  2 = fast (~60 games/hr)
-                    #  3 = balanced (default)
-                    #  4 = strong  (~10 games/hr)
+TRAIN_DEPTH = 5     # search depth during self-play training
+                    # (measured on M5, 4 workers, June 2026)
+                    #  3 ≈ 1000+ games/hr (shallow, fast)
+                    #  4 ≈  470 games/hr
+                    #  5 ≈  235 games/hr (default — deeper AND faster than
+                    #      the old 1.5s-per-move time-limited search)
+                    #  6 ≈ half the speed of 5
 NUM_WORKERS = 4     # parallel self-play workers during --train
                     #  0    = auto (use all CPU cores)
                     #  1    = single core (old behavior)
@@ -324,8 +327,9 @@ class Board:
         rows = range(8) if perspective == 'w' else range(7, -1, -1)
         cols = range(8) if perspective == 'w' else range(7, -1, -1)
 
-        # chess.com palette with boosted contrast
-        LIGHT = '\033[48;2;245;230;180m'   # warm cream
+        # Mid-tone palette: light squares dark enough that pure-white pieces
+        # stay visible, yet still clearly lighter than the green dark squares.
+        LIGHT = '\033[48;2;150;135;90m'    # olive tan
         DARK  = '\033[48;2;75;110;55m'     # deep forest green
         WHITE_PIECE = '\033[38;2;255;255;255m\033[1m'
         BLACK_PIECE = '\033[38;2;0;0;0m\033[1m'
@@ -350,7 +354,13 @@ class Board:
                 piece = self.grid[r][c]
                 if piece:
                     color_code = WHITE_PIECE if piece.color == 'w' else BLACK_PIECE
-                    sym = UNICODE[(piece.kind, piece.color)]
+                    # Both sides use the FILLED glyphs (the 'w' set) and are told
+                    # apart by the ANSI foreground colour. The trailing U+FE0E
+                    # (text variation selector) forces text — not emoji —
+                    # presentation: without it, glyphs with default emoji style
+                    # (notably the pawn, U+265F) ignore the ANSI colour and render
+                    # in a fixed colour, so one side comes out in mixed shades.
+                    sym = UNICODE[(piece.kind, 'w')] + '︎'
                     row_str += f"{bg} {color_code}{sym}{RESET}{bg} {RESET}"
                 else:
                     row_str += f"{bg}   {RESET}"
@@ -362,20 +372,28 @@ class Board:
 
 # ── Move generation ───────────────────────────────────────────────────────────
 def raw_moves(board, r, c):
-    piece = board.get(r, c)
+    # Hot path: called millions of times per search (move gen, mobility in
+    # evaluate(), and build_attack_map). Kept behaviourally identical to the
+    # original but reads board.grid directly (no Board.get() dispatch),
+    # inlines the 0<=x<8 bounds checks, reuses the module-level offset tables,
+    # and caches moves.append — all of which the profiler flagged as hot.
+    g = board.grid
+    piece = g[r][c]
     if piece is None: return []
-    kind, color = piece.kind, piece.color
+    kind  = piece.kind
+    color = piece.color
     opp = 'b' if color == 'w' else 'w'
     moves = []
+    ap = moves.append
 
     def add(dr, dc, slide=False):
-        nr, nc = r + dr, c + dc
-        while in_bounds(nr, nc):
-            target = board.get(nr, nc)
+        nr = r + dr; nc = c + dc
+        while 0 <= nr < 8 and 0 <= nc < 8:
+            target = g[nr][nc]
             if target is None:
-                moves.append((nr, nc, None))
+                ap((nr, nc, None))
             elif target.color == opp:
-                moves.append((nr, nc, None))
+                ap((nr, nc, None))
                 break
             else:
                 break
@@ -385,43 +403,42 @@ def raw_moves(board, r, c):
     if kind == 'P':
         direction = -1 if color == 'w' else 1
         nr = r + direction
-        if in_bounds(nr, c) and board.get(nr, c) is None:
-            moves.append((nr, c, None))
+        if 0 <= nr < 8 and g[nr][c] is None:
+            ap((nr, c, None))
             start_rank = 6 if color == 'w' else 1
             nr2 = r + 2 * direction
-            if r == start_rank and board.get(nr2, c) is None:
-                moves.append((nr2, c, None))
+            if r == start_rank and g[nr2][c] is None:
+                ap((nr2, c, None))
         for dc in (-1, 1):
             nc = c + dc
-            if in_bounds(nr, nc):
-                target = board.get(nr, nc)
+            if 0 <= nr < 8 and 0 <= nc < 8:
+                target = g[nr][nc]
                 if target and target.color == opp:
-                    moves.append((nr, nc, None))
+                    ap((nr, nc, None))
                 if board.en_passant == sq(nr, nc):
-                    moves.append((nr, nc, 'ep'))
+                    ap((nr, nc, 'ep'))
     elif kind == 'N':
-        for dr, dc in [(-2,-1),(-2,1),(-1,-2),(-1,2),(1,-2),(1,2),(2,-1),(2,1)]:
-            add(dr, dc)
+        for dr, dc in _KNIGHT_OFFSETS: add(dr, dc)
     elif kind == 'B':
-        for dr, dc in [(-1,-1),(-1,1),(1,-1),(1,1)]: add(dr, dc, True)
+        for dr, dc in _DIAG_DIRS: add(dr, dc, True)
     elif kind == 'R':
-        for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]: add(dr, dc, True)
+        for dr, dc in _CROSS_DIRS: add(dr, dc, True)
     elif kind == 'Q':
-        for dr, dc in [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]: add(dr, dc, True)
+        for dr, dc in _KING_OFFSETS: add(dr, dc, True)
     elif kind == 'K':
-        for dr, dc in [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]: add(dr, dc)
+        for dr, dc in _KING_OFFSETS: add(dr, dc)
         if not piece.moved:
             back_rank = 7 if color == 'w' else 0
             if r == back_rank:
-                rook = board.get(back_rank, 7)
+                rook = g[back_rank][7]
                 if (rook and rook.kind == 'R' and not rook.moved and
-                        board.get(back_rank, 5) is None and board.get(back_rank, 6) is None):
-                    moves.append((back_rank, 6, 'castle_k'))
-                rook = board.get(back_rank, 0)
+                        g[back_rank][5] is None and g[back_rank][6] is None):
+                    ap((back_rank, 6, 'castle_k'))
+                rook = g[back_rank][0]
                 if (rook and rook.kind == 'R' and not rook.moved and
-                        board.get(back_rank, 1) is None and
-                        board.get(back_rank, 2) is None and board.get(back_rank, 3) is None):
-                    moves.append((back_rank, 2, 'castle_q'))
+                        g[back_rank][1] is None and
+                        g[back_rank][2] is None and g[back_rank][3] is None):
+                    ap((back_rank, 2, 'castle_q'))
     return moves
 
 
@@ -468,15 +485,97 @@ def apply_move(board, from_r, from_c, to_r, to_c, flag, promotion='Q'):
     return b
 
 
+# ── Make/unmake (in-place apply_move for the search) ─────────────────────────
+# apply_move() copies the whole 64-square board for every move tried — the
+# profiler showed that as millions of Piece.copy calls per search. make_move
+# mutates the board in place and returns an undo record; unmake_move restores
+# it exactly. Semantics mirror apply_move: returns None (board restored) for
+# illegal moves (king left in check / castling through check).
+def make_move(board, r0, c0, r1, c1, flag, promotion='Q'):
+    g     = board.grid
+    piece = g[r0][c0]
+    color = piece.color
+    # undo record: [piece, prior_moved, r0, c0, r1, c1, captured_at_dest,
+    #               ep_pawn, ep_row, prior_en_passant,
+    #               rook, rook_prior_moved, rook_from_c, rook_to_c]
+    undo = [piece, piece.moved, r0, c0, r1, c1, g[r1][c1],
+            None, 0, board.en_passant, None, False, 0, 0]
+    board.en_passant = None
+
+    if flag == 'ep':
+        direction = -1 if color == 'w' else 1
+        er = r1 - direction
+        undo[7] = g[er][c1]; undo[8] = er
+        g[er][c1] = None
+    elif flag == 'castle_k':
+        rook = g[r1][7]
+        undo[10] = rook; undo[11] = rook.moved; undo[12] = 7; undo[13] = 5
+        g[r1][7] = None; g[r1][5] = rook; rook.moved = True
+        for col in (5, 6):   # f1/f8 and g1/g8 — don't include starting square
+            saved = g[r1][col]
+            g[r1][col] = piece; g[r0][c0] = None
+            chk = is_in_check(board, color)
+            g[r1][col] = saved; g[r0][c0] = piece
+            if chk:
+                g[r1][5] = None; g[r1][7] = rook; rook.moved = undo[11]
+                board.en_passant = undo[9]
+                return None
+    elif flag == 'castle_q':
+        rook = g[r1][0]
+        undo[10] = rook; undo[11] = rook.moved; undo[12] = 0; undo[13] = 3
+        g[r1][0] = None; g[r1][3] = rook; rook.moved = True
+        for col in (3, 2):   # d1/d8 and c1/c8 — don't include starting square
+            saved = g[r1][col]
+            g[r1][col] = piece; g[r0][c0] = None
+            chk = is_in_check(board, color)
+            g[r1][col] = saved; g[r0][c0] = piece
+            if chk:
+                g[r1][3] = None; g[r1][0] = rook; rook.moved = undo[11]
+                board.en_passant = undo[9]
+                return None
+
+    if piece.kind == 'P' and (r1 - r0 == 2 or r0 - r1 == 2):
+        board.en_passant = sq((r0 + r1) // 2, c1)
+
+    g[r1][c1] = piece; g[r0][c0] = None
+    piece.moved = True
+
+    if piece.kind == 'P' and (r1 == 0 or r1 == 7):
+        g[r1][c1] = Piece(promotion.upper(), color)
+
+    if is_in_check(board, color):
+        unmake_move(board, undo)
+        return None
+    return undo
+
+
+def unmake_move(board, undo):
+    (piece, prior_moved, r0, c0, r1, c1, captured,
+     ep_pawn, ep_r, prior_ep, rook, rook_moved, rf, rt) = undo
+    g = board.grid
+    g[r0][c0] = piece          # also discards any promoted piece at (r1,c1)
+    piece.moved = prior_moved
+    g[r1][c1] = captured
+    if ep_pawn is not None:
+        g[ep_r][c1] = ep_pawn
+    if rook is not None:
+        g[r1][rt] = None
+        g[r1][rf] = rook
+        rook.moved = rook_moved
+    board.en_passant = prior_ep
+
+
 def legal_moves(board, color):
     result = []
+    g = board.grid
     for r in range(8):
         for c in range(8):
-            p = board.get(r, c)
+            p = g[r][c]
             if p and p.color == color:
                 for to_r, to_c, flag in raw_moves(board, r, c):
-                    nb = apply_move(board, r, c, to_r, to_c, flag)
-                    if nb is not None:
+                    u = make_move(board, r, c, to_r, to_c, flag)
+                    if u is not None:
+                        unmake_move(board, u)
                         result.append((r, c, to_r, to_c, flag))
     return result
 
@@ -564,13 +663,16 @@ def encode_board(board, color):
 
 # ── PyTorch network (GPU) ─────────────────────────────────────────────────────
 if _TORCH_OK:
-    # Detect GPU — prefers CUDA (Nvidia), then MPS (Apple), then CPU
+    # Device choice is tuned for this engine's access pattern.
+    # predict()/td_step() run inference ONE position at a time inside the
+    # search, thousands of times per move. That is latency-bound: an MPS
+    # (Apple GPU) round-trip per call costs far more than the tiny network
+    # actually computes, so MPS is *slower* than CPU here. CUDA batches well
+    # enough to still be worth it; otherwise stay on the CPU.
     if torch.cuda.is_available():
         _DEVICE = torch.device('cuda')
-    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        _DEVICE = torch.device('mps')
     else:
-        _DEVICE = torch.device('cpu')
+        _DEVICE = torch.device('cpu')   # M5 CPU beats MPS for per-position inference
 
     class _TorchNet(nn.Module):
         """
@@ -664,8 +766,11 @@ class ChessNet:
         """Return centipawn score (+ve = white better)."""
         enc = encode_board(board, color)
         if self._use_torch:
-            with torch.no_grad():
-                x   = torch.tensor(enc, dtype=torch.float32).to(_DEVICE)
+            # inference_mode + from_numpy: same numerics as the old
+            # no_grad/torch.tensor path, less per-call overhead (predict is
+            # called once per evaluate() when the NN blend is active)
+            with torch.inference_mode():
+                x   = torch.from_numpy(enc).to(_DEVICE)
                 val = self._torch(x.unsqueeze(0)).item()
         else:
             val = self._np_forward(enc)
@@ -872,23 +977,27 @@ def is_endgame(board):
 
 def build_attack_map(board, color):
     """
-    Returns a dict {(r,c): count} of squares attacked by `color`.
-    Also returns list of (attacker_piece, to_r, to_c) for tactical use.
-    Uses pre-computed raw_moves — called once per evaluate().
+    Returns a dict {(r,c): count} of squares attacked by `color`,
+    a list of (attacker_piece, to_r, to_c) for tactical use, and a dict
+    {(r,c): len(raw_moves)} so evaluate() can reuse the mobility counts
+    instead of generating every piece's moves a second time.
     """
     attacks = {}
     attacker_list = []
+    mobility = {}
     g = board.grid
     for r in range(8):
         for c in range(8):
             p = g[r][c]
             if p and p.color == color:
-                for mr, mc, _ in raw_moves(board, r, c):
+                mvs = raw_moves(board, r, c)
+                mobility[(r, c)] = len(mvs)
+                for mr, mc, _ in mvs:
                     key = (mr, mc)
                     if key in attacks: attacks[key] += 1
                     else:              attacks[key]  = 1
                     attacker_list.append((p, mr, mc))
-    return attacks, attacker_list
+    return attacks, attacker_list, mobility
 
 
 def tactical_score(board, color, atk_map, atk_list, opp_atk_map):
@@ -995,56 +1104,70 @@ def evaluate(board):
     Material + PST + pawn structure + king safety + mobility +
     bishop pair + rook files + forks + hanging pieces.
     """
-    # Endgame detection inline (avoid second board scan)
+    # One scan: endgame detection + pawn-structure tables (column counts,
+    # per-column rows, pawns per square colour). Replaces the per-pawn /
+    # per-bishop / per-rook full-board rescans the profiler flagged.
+    g = board.grid
     queens = minor = 0
+    pawn_cols = {'w': [0]*8, 'b': [0]*8}
+    pawn_rows = {'w': [[] for _ in range(8)], 'b': [[] for _ in range(8)]}
+    pawn_sqc  = {'w': [0, 0], 'b': [0, 0]}
     for r in range(8):
+        row = g[r]
         for c in range(8):
-            p = board.grid[r][c]
+            p = row[c]
             if p:
-                if p.kind == 'Q': queens += 1
-                elif p.kind in ('N','B','R'): minor += 1
+                k = p.kind
+                if k == 'Q': queens += 1
+                elif k in ('N','B','R'): minor += 1
+                elif k == 'P':
+                    pc = p.color
+                    pawn_cols[pc][c] += 1
+                    pawn_rows[pc][c].append(r)
+                    pawn_sqc[pc][(r + c) % 2] += 1
     endgame   = queens == 0 or (queens <= 2 and minor <= 2)
     score     = 0
     w_bishops = b_bishops = 0
     w_mob = b_mob = 0
 
-    # Build attack maps once for the whole evaluation
-    w_atk, w_atk_list = build_attack_map(board, 'w')
-    b_atk, b_atk_list = build_attack_map(board, 'b')
+    # Build attack maps once for the whole evaluation (also yields mobility)
+    w_atk, w_atk_list, w_mobility = build_attack_map(board, 'w')
+    b_atk, b_atk_list, b_mobility = build_attack_map(board, 'b')
 
     for r in range(8):
+        row = g[r]
         for c in range(8):
-            p = board.get(r, c)
+            p = row[c]
             if p is None:
                 continue
             sign = 1 if p.color == 'w' else -1
             val  = PIECE_VALUE[p.kind]
             val += pst_score(p.kind, p.color, r, c, endgame)
-            # Mobility counted here (pseudo-legal, fast)
-            mob = len(raw_moves(board, r, c))
-            if p.color == 'w': w_mob += mob
-            else:              b_mob += mob
+            # Mobility (pseudo-legal) — reused from the attack-map pass
+            if p.color == 'w': w_mob += w_mobility[(r, c)]
+            else:              b_mob += b_mobility[(r, c)]
 
             if p.kind == 'P':
                 opp_c = 'b' if p.color == 'w' else 'w'
-                dirn  = -1 if p.color == 'w' else 1
+                own_cols = pawn_cols[p.color]
                 # Doubled pawns
-                col_pawns = sum(1 for rr in range(8)
-                    if (pp := board.get(rr, c)) and pp.kind == 'P' and pp.color == p.color)
-                if col_pawns > 1: val -= 25
+                if own_cols[c] > 1: val -= 25
                 # Isolated pawns
-                neighbour = any(
-                    any((pp := board.get(rr, c + dc)) and pp.kind == 'P' and pp.color == p.color
-                        for rr in range(8))
-                    for dc in (-1, 1) if 0 <= c + dc < 8
-                )
+                neighbour = ((c > 0 and own_cols[c-1] > 0) or
+                             (c < 7 and own_cols[c+1] > 0))
                 if not neighbour: val -= 20
-                # Passed pawn
-                passed = not any(
-                    (pp := board.get(rr, c + dc)) and pp.kind == 'P' and pp.color == opp_c
-                    for rr in range(r + dirn, (0 if dirn == -1 else 8), dirn)
-                    for dc in (-1, 0, 1) if 0 <= c + dc < 8
-                )
+                # Passed pawn: no enemy pawn ahead on this or adjacent files
+                # (same row ranges as the original scan: rows 1..r-1 for
+                # white, rows r+1..7 for black)
+                opp_rows = pawn_rows[opp_c]
+                if p.color == 'w':
+                    passed = not any(0 < rr < r
+                                     for dc in (-1, 0, 1) if 0 <= c + dc < 8
+                                     for rr in opp_rows[c + dc])
+                else:
+                    passed = not any(rr > r
+                                     for dc in (-1, 0, 1) if 0 <= c + dc < 8
+                                     for rr in opp_rows[c + dc])
                 if passed:
                     advance = (6 - r) if p.color == 'w' else (r - 1)
                     val += 20 + advance * 15
@@ -1057,17 +1180,11 @@ def evaluate(board):
                 if p.color == 'w': w_bishops += 1
                 else:              b_bishops += 1
                 # Penalty for pawns on same colour
-                sq_color = (r + c) % 2
-                same_col_pawns = sum(
-                    1 for rr in range(8) for cc in range(8)
-                    if (rr + cc) % 2 == sq_color
-                    and (pp := board.get(rr, cc)) and pp.kind == 'P' and pp.color == p.color
-                )
-                val -= same_col_pawns * 3
+                val -= pawn_sqc[p.color][(r + c) % 2] * 3
 
             elif p.kind == 'R':
-                own_p = any((pp := board.get(rr, c)) and pp.kind=='P' and pp.color==p.color for rr in range(8))
-                opp_p = any((pp := board.get(rr, c)) and pp.kind=='P' and pp.color!=p.color for rr in range(8))
+                own_p = pawn_cols[p.color][c] > 0
+                opp_p = pawn_cols['b' if p.color == 'w' else 'w'][c] > 0
                 if not own_p and not opp_p: val += 30
                 elif not own_p:             val += 15
                 # Rook on 7th rank
@@ -1081,9 +1198,10 @@ def evaluate(board):
                 centre = {(2,2),(2,3),(2,4),(2,5),(3,2),(3,3),(3,4),(3,5),
                           (4,2),(4,3),(4,4),(4,5),(5,2),(5,3),(5,4),(5,5)}
                 if (r, c) in centre:
+                    nr = r + dirn
                     attackable = any(
-                        (pp := board.get(r+dirn, c+dc)) and pp.kind=='P' and pp.color==opp_c
-                        for dc in (-1, 1) if in_bounds(r+dirn, c+dc)
+                        (pp := g[nr][c+dc]) and pp.kind=='P' and pp.color==opp_c
+                        for dc in (-1, 1) if 0 <= nr < 8 and 0 <= c + dc < 8
                     )
                     if not attackable: val += 20
 
@@ -1318,9 +1436,12 @@ def quiescence(board, alpha, beta, color, depth=0):
         # Skip losing captures (except when in check — must escape)
         if is_cap and not in_check and depth > 0 and is_losing_capture(board, move):
             continue
-        nb = apply_move(board, r0, c0, r1, c1, flag)
-        if nb is None: continue
-        score = -quiescence(nb, -beta, -alpha, opp, depth + 1)
+        u = make_move(board, r0, c0, r1, c1, flag)
+        if u is None: continue
+        try:
+            score = -quiescence(board, -beta, -alpha, opp, depth + 1)
+        finally:
+            unmake_move(board, u)
         if score >= beta: return beta
         if score > alpha: alpha = score
 
@@ -1360,10 +1481,15 @@ def negamax(board, depth, alpha, beta, color, deadline, ply=0, do_null=True):
     if (do_null and not in_check and depth >= NULL_REDUCTION + 1
             and not is_endgame(board) and own_material >= 1300
             and abs(beta) < 50000):
-        null_board = board.copy()
-        null_board.en_passant = None
-        null_val, _ = negamax(null_board, depth - NULL_REDUCTION - 1,
-                               -beta, -beta + 1, opp, deadline, ply + 1, do_null=False)
+        # In-place null move: just clear en passant for the pass (try/finally
+        # so a TimeoutError unwinding the recursion still restores it)
+        saved_ep = board.en_passant
+        board.en_passant = None
+        try:
+            null_val, _ = negamax(board, depth - NULL_REDUCTION - 1,
+                                   -beta, -beta + 1, opp, deadline, ply + 1, do_null=False)
+        finally:
+            board.en_passant = saved_ep
         null_val = -null_val
         if null_val >= beta:
             return beta, None   # No verify — R=2 is already conservative
@@ -1402,25 +1528,28 @@ def negamax(board, depth, alpha, beta, color, deadline, ply=0, do_null=True):
         if is_capture and depth <= 2 and is_losing_capture(board, move):
             continue
 
-        nb = apply_move(board, r0, c0, r1, c1, flag)
-        if nb is None: continue
+        # Make in place; finally-block guarantees restore even on TimeoutError
+        u = make_move(board, r0, c0, r1, c1, flag)
+        if u is None: continue
+        try:
+            gives_check = is_in_check(board, opp)
 
-        gives_check = is_in_check(nb, opp)
+            # Late Move Reduction — strictly quiet, non-tactical moves only
+            reduction = 0
+            if (i >= 4 and depth >= 3 and not is_capture and not is_promo
+                    and not in_check and not gives_check and not is_killer
+                    and not is_in_check(board, color)):   # extra guard
+                reduction = 1
 
-        # Late Move Reduction — strictly quiet, non-tactical moves only
-        reduction = 0
-        if (i >= 4 and depth >= 3 and not is_capture and not is_promo
-                and not in_check and not gives_check and not is_killer
-                and not is_in_check(nb, color)):   # extra guard
-            reduction = 1
-
-        val, _ = negamax(nb, depth - 1 - reduction, -beta, -alpha, opp, deadline, ply + 1)
-        val = -val
-
-        # Re-search at full depth if LMR move beats alpha
-        if reduction > 0 and val > alpha:
-            val, _ = negamax(nb, depth - 1, -beta, -alpha, opp, deadline, ply + 1)
+            val, _ = negamax(board, depth - 1 - reduction, -beta, -alpha, opp, deadline, ply + 1)
             val = -val
+
+            # Re-search at full depth if LMR move beats alpha
+            if reduction > 0 and val > alpha:
+                val, _ = negamax(board, depth - 1, -beta, -alpha, opp, deadline, ply + 1)
+                val = -val
+        finally:
+            unmake_move(board, u)
 
         if val > best_val:
             best_val  = val
@@ -1825,8 +1954,13 @@ def import_pgn(path, max_games=None, add_to_book=True, add_to_replay=True):
     print(f"  Total replay     : {len(replay.buf)}")
 
 
-def best_move_id(board, color, time_limit=TIME_LIMIT):
-    """Iterative deepening with aspiration windows + opening book."""
+def best_move_id(board, color, time_limit=TIME_LIMIT, max_depth=None):
+    """Iterative deepening with aspiration windows + opening book.
+
+    max_depth: stop after completing that depth (training uses TRAIN_DEPTH
+    for consistent per-move quality); None = keep deepening until time runs
+    out (interactive play). time_limit still applies either way.
+    """
     # Opening book lookup first (instant — no search needed)
     if board.full_moves <= 15:
         book_move = opening_book_move(board, color)
@@ -1850,7 +1984,7 @@ def best_move_id(board, color, time_limit=TIME_LIMIT):
     prev_val  = 0
     WINDOW    = 50   # aspiration window
 
-    for depth in range(1, 30):
+    for depth in range(1, (max_depth or 29) + 1):
         # Aspiration windows: narrow alpha/beta around previous score
         if depth >= 4:
             alpha = prev_val - WINDOW
@@ -2092,6 +2226,14 @@ def _selfplay_worker(worker_id, result_queue, stop_event, pause_event=None):
     # Each worker uses a different random seed
     random.seed(os.getpid() + worker_id * 1000 + int(time.time()))
 
+    # Pin this process to a single compute thread. Otherwise every worker
+    # lets PyTorch/BLAS spawn one thread per core, so N workers explode into
+    # N*cores threads all fighting over the M5's 10 cores — far slower than
+    # the worker count alone would suggest. One thread per process keeps the
+    # parallelism equal to NUM_WORKERS, which is what we actually want.
+    if _TORCH_OK:
+        torch.set_num_threads(1)
+
     opp_map   = {'w': 'b', 'b': 'w'}
     MAX_MOVES = 200
 
@@ -2114,7 +2256,12 @@ def _selfplay_worker(worker_id, result_queue, stop_event, pause_event=None):
                             1.0 if is_in_check(board, turn) else 0.0)
                 break
 
-            move = best_move_id(board, turn, time_limit=2.0)
+            # Fixed-depth search: every move gets the same quality and fast
+            # positions finish early instead of burning a fixed time budget.
+            # The 8s cap is a safety valve for rare pathological positions —
+            # if it hits, best_move_id returns the last completed depth.
+            move = best_move_id(board, turn, time_limit=8.0,
+                                max_depth=TRAIN_DEPTH)
             if not move:
                 outcome = 0.0; break
 
